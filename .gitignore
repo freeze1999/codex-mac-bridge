@@ -1,0 +1,18 @@
+# Runtime logs, contain full task/response history, keep local
+bridge.log
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Env / secrets
+.env
+*.key
+*.pem
+
+# macOS
+.DS_Store
