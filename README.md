@@ -56,6 +56,8 @@ export CODEX_BRIDGE_SSH_HOST="user@100.x.x.x"           # required
 export CODEX_BRIDGE_CODEX_BIN="/usr/local/bin/codex"    # if not in PATH
 export CODEX_BRIDGE_MODEL="gpt-4o"                      # optional
 export CODEX_BRIDGE_TIMEOUT="600"                       # optional, default 600s
+export CODEX_BRIDGE_SANDBOX="read-only"                 # optional, see trust boundary
+export CODEX_BRIDGE_LOG_MAX_BYTES="10000000"            # optional, log rotation
 ```
 
 ### 4. Wire into your MCP config
@@ -197,3 +199,27 @@ python3 monitor.py /path/to/bridge.log
 - Session continuity depends on Codex session state on the Mac, sessions are lost if Codex restarts
 - `bridge.log` grows unbounded without rotation
 - Async server, concurrent tool calls are supported but each delegation opens its own SSH connection
+
+## Trust boundary
+
+The bridge always runs `codex exec --ask-for-approval never` (exec mode is
+non-interactive), so the sandbox is the safety boundary: any agent that can
+call this MCP tool can run whatever the sandbox mode allows on the Mac. Set
+`CODEX_BRIDGE_SANDBOX=read-only` unless the delegated work needs writes;
+unset, the Codex CLI's own default applies.
+
+The audit log (`bridge.log`) records the full task, context, and response
+text of every delegation. Treat it as sensitive and leave it out of any
+repo (it is gitignored here).
+
+## Status
+
+What this is: a single-tool MCP server that delegates coding tasks to the
+Codex CLI on one Mac over SSH, with session continuity and an audit log.
+
+What this is NOT: an authentication layer, a sandbox of its own, or a
+multi-host router. The argument building, NDJSON parsing, and log rotation
+are unit-tested; the SSH path is exercised by supervised live delegations,
+not CI. The Codex CLI's output format and flags move quickly; the arg
+shapes here were last checked against the Codex docs, verify against
+`codex --help` on your Mac. This file has a sibling repo, see PORTING.md.
