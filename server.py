@@ -10,6 +10,13 @@ Configuration (env vars):
   CODEX_BRIDGE_TIMEOUT    Seconds before timeout            (default: 600)
   CODEX_BRIDGE_MODEL      Model override, e.g. gpt-4o       (optional)
   CODEX_BRIDGE_LOG_PATH   Path for delegation audit log     (default: ./bridge.log)
+  CODEX_BRIDGE_LOG_MAX_BYTES  Rotate the log past this size (default: 10000000)
+  CODEX_BRIDGE_SANDBOX    Codex --sandbox mode, e.g. read-only or
+    workspace-write (optional). Unset keeps the Codex CLI's own default.
+    The bridge always runs with --ask-for-approval never (exec mode is
+    non-interactive), so the sandbox IS the safety boundary: any agent that
+    can call this MCP tool can run whatever the sandbox mode allows on the
+    Mac. Set read-only unless you need writes.
 """
 
 import asyncio
@@ -28,6 +35,8 @@ MAC_HOST       = os.environ.get("CODEX_BRIDGE_SSH_HOST", "")
 MAC_CODEX      = os.environ.get("CODEX_BRIDGE_CODEX_BIN", "codex")
 CODEX_TIMEOUT  = int(os.environ.get("CODEX_BRIDGE_TIMEOUT", "600"))
 CODEX_MODEL    = os.environ.get("CODEX_BRIDGE_MODEL", "").strip()
+CODEX_SANDBOX  = os.environ.get("CODEX_BRIDGE_SANDBOX", "").strip()
+LOG_MAX_BYTES  = int(os.environ.get("CODEX_BRIDGE_LOG_MAX_BYTES", "10000000"))
 SSH_OPTS       = ["-o", "ConnectTimeout=10", "-o", "BatchMode=yes",
                   "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3"]
 LOG_FILE       = os.environ.get("CODEX_BRIDGE_LOG_PATH",
@@ -58,13 +67,60 @@ _TOOL_TYPES = frozenset((
 ))
 
 
-def log_event(event: dict):
+def should_rotate(path: str, max_bytes: int) -> bool:
     try:
+        return max_bytes > 0 and os.path.getsize(path) >= max_bytes
+    except OSError:
+        return False
+
+
+def log_event(event: dict):
+    """Append one JSON line; size-rotate to a single .1 generation first.
+    The log holds full task/response text, rotation keeps it from growing
+    without bound."""
+    try:
+        if should_rotate(LOG_FILE, LOG_MAX_BYTES):
+            os.replace(LOG_FILE, LOG_FILE + ".1")
         with open(LOG_FILE, "a") as f:
             f.write(json.dumps(event) + "\n")
             f.flush()
     except Exception:
         pass
+
+
+def build_codex_args(codex_bin: str, resume_session: str, model: str,
+                     sandbox: str) -> list[str]:
+    """The literal '"$TASK"' is load-bearing: the task text is piped in over
+    stdin (remote command starts with TASK=$(cat)) so it never touches the
+    command line and cannot inject into the shell. Do not "fix" it into an
+    f-string or shlex.quote of the prompt.
+
+    New session:  codex exec --ask-for-approval never --json [opts] "$TASK"
+    Resume:       codex exec resume SESSION_ID "$TASK" [opts]
+                  Per Codex docs the follow-up prompt is positional after
+                  the session id."""
+    common = ["--ask-for-approval", "never", "--json"]
+    if model:
+        common += ["--model", shlex.quote(model)]
+    if sandbox:
+        common += ["--sandbox", shlex.quote(sandbox)]
+    if resume_session:
+        return ([codex_bin, "exec", "resume", shlex.quote(resume_session),
+                 '"$TASK"'] + common)
+    return [codex_bin, "exec"] + common + ['"$TASK"']
+
+
+def build_remote_command(args: list[str], timeout_s: int) -> str:
+    """Wrap with a remote timeout so Codex is killed on the Mac if SSH drops.
+    Portable: 'timeout' (GNU) or 'gtimeout' (macOS + coreutils), or no
+    timeout if neither exists. Remote budget is 10s under the local one so
+    the remote side dies first."""
+    remote_timeout = max(timeout_s - 10, 30)
+    prefix = (
+        '_T=$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true); '
+        f'${{_T:+$_T {remote_timeout}}}'
+    )
+    return f'TASK=$(cat); {prefix} {" ".join(args)}'
 
 
 def _parse_codex_output(raw: str) -> tuple[str, str]:
@@ -199,31 +255,9 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
     prompt = f"Context:\n{context}\n\n---\n\nTask:\n{task}" if context else task
 
-    # Build codex exec command.
-    # New session:  codex exec --ask-for-approval never --json [--model M] "$TASK"
-    # Resume:       codex exec resume SESSION_ID "$TASK" --ask-for-approval never --json
-    #               Per Codex docs the follow-up prompt is a positional arg after session_id.
-    if resume_session:
-        codex_args = [MAC_CODEX, "exec", "resume", shlex.quote(resume_session), '"$TASK"',
-                      "--ask-for-approval", "never", "--json"]
-        if CODEX_MODEL:
-            codex_args += ["--model", shlex.quote(CODEX_MODEL)]
-    else:
-        codex_args = [MAC_CODEX, "exec", "--ask-for-approval", "never", "--json"]
-        if CODEX_MODEL:
-            codex_args += ["--model", shlex.quote(CODEX_MODEL)]
-        codex_args.append('"$TASK"')
-
-    # Wrap with remote timeout so Codex is killed on the Mac if SSH drops.
-    # Buffer is 10s shorter than local timeout so remote dies first.
-    # Uses portable shell: 'timeout' (Linux/GNU) or 'gtimeout' (macOS + coreutils).
-    # Falls back to no timeout if neither is available, remote process may outlive SSH.
-    _remote_timeout = max(CODEX_TIMEOUT - 10, 30)
-    _timeout_prefix = (
-        f'_T=$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true); '
-        f'${{_T:+$_T {_remote_timeout}}}'
-    )
-    remote_cmd = f'TASK=$(cat); {_timeout_prefix} {" ".join(codex_args)}'
+    codex_args = build_codex_args(MAC_CODEX, resume_session, CODEX_MODEL,
+                                  CODEX_SANDBOX)
+    remote_cmd = build_remote_command(codex_args, CODEX_TIMEOUT)
 
     try:
         proc = await asyncio.create_subprocess_exec(
