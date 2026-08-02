@@ -102,7 +102,7 @@ ask_codex(task="Now add unit tests for it", resume_session_id="<session_id>")
 | `CODEX_BRIDGE_MODEL` | _(default)_ | Model override, e.g. `gpt-4o` |
 | `CODEX_BRIDGE_LOG_PATH` | `./bridge.log` | Path for delegation audit log |
 
-## Session Chaining
+## Session chaining
 
 Every response includes a `session_id`. Pass it back as `resume_session_id` to continue the same conversation, Codex remembers all prior context and decisions.
 
@@ -116,7 +116,7 @@ r2 = ask_codex(task="Add rate limiting to the auth module", resume_session_id="a
 r3 = ask_codex(task="Write tests for all of it", resume_session_id="abc123")
 ```
 
-## Long Tasks: tmux Blocking Loop
+## Long tasks: the tmux blocking loop
 
 The MCP tool has a hard wall-clock timeout (default 600s). For tasks that may run longer, project scaffolding, multi-file builds, long refactors, use this tmux pattern instead. It blocks until Codex finishes and returns the full result + `session_id`.
 
