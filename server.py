@@ -27,9 +27,9 @@ import time
 import uuid
 from datetime import datetime, timezone
 
+from mcp import types
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp import types
 
 MAC_HOST       = os.environ.get("CODEX_BRIDGE_SSH_HOST", "")
 MAC_CODEX      = os.environ.get("CODEX_BRIDGE_CODEX_BIN", "codex")
@@ -49,7 +49,7 @@ async def _log_codex_version():
     """Log the Codex CLI version at startup for debugging."""
     try:
         proc = await asyncio.create_subprocess_exec(
-            "ssh", *SSH_OPTS, MAC_HOST, f"{MAC_CODEX} --version",
+            "ssh", *SSH_OPTS, MAC_HOST, f"{shlex.quote(MAC_CODEX)} --version",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
@@ -89,25 +89,26 @@ def log_event(event: dict):
 
 
 def build_codex_args(codex_bin: str, resume_session: str, model: str,
-                     sandbox: str) -> list[str]:
+                     sandbox: str, workdir: str = "") -> list[str]:
     """The literal '"$TASK"' is load-bearing: the task text is piped in over
     stdin (remote command starts with TASK=$(cat)) so it never touches the
     command line and cannot inject into the shell. Do not "fix" it into an
     f-string or shlex.quote of the prompt.
 
-    New session:  codex exec --ask-for-approval never --json [opts] "$TASK"
-    Resume:       codex exec resume SESSION_ID "$TASK" [opts]
-                  Per Codex docs the follow-up prompt is positional after
-                  the session id."""
-    common = ["--ask-for-approval", "never", "--json"]
+    Global flags must precede `exec`; `resume` accepts only its own narrower
+    option set. The follow-up prompt remains positional after the session ID.
+    """
+    global_args = [shlex.quote(codex_bin), "--ask-for-approval", "never"]
     if model:
-        common += ["--model", shlex.quote(model)]
+        global_args += ["--model", shlex.quote(model)]
     if sandbox:
-        common += ["--sandbox", shlex.quote(sandbox)]
+        global_args += ["--sandbox", shlex.quote(sandbox)]
+    if workdir:
+        global_args += ["--cd", shlex.quote(workdir)]
     if resume_session:
-        return ([codex_bin, "exec", "resume", shlex.quote(resume_session),
-                 '"$TASK"'] + common)
-    return [codex_bin, "exec"] + common + ['"$TASK"']
+        return global_args + ["exec", "resume", "--json",
+                              shlex.quote(resume_session), '"$TASK"']
+    return global_args + ["exec", "--json", '"$TASK"']
 
 
 def build_remote_command(args: list[str], timeout_s: int) -> str:
@@ -121,6 +122,34 @@ def build_remote_command(args: list[str], timeout_s: int) -> str:
         f'${{_T:+$_T {remote_timeout}}}'
     )
     return f'TASK=$(cat); {prefix} {" ".join(args)}'
+
+
+def _event_session_id(event: dict) -> str:
+    return (event.get("session_id", "") or event.get("sessionId", "")
+            or event.get("thread_id", "") or event.get("threadId", ""))
+
+
+def _event_response(event: dict) -> str:
+    """Extract assistant text from current and legacy Codex JSONL events."""
+    item = event.get("item")
+    if isinstance(item, dict):
+        if item.get("type") != "agent_message":
+            return ""
+        text = item.get("text", "")
+        return text.strip() if isinstance(text, str) else ""
+
+    if event.get("type", "") in _TOOL_TYPES:
+        return ""
+    content = (event.get("content", "") or event.get("text", "")
+               or event.get("message", "") or event.get("output", "")
+               or event.get("response", ""))
+    if isinstance(content, list):
+        content = " ".join(
+            block.get("text", "") for block in content
+            if isinstance(block, dict)
+            and block.get("type") in {"text", "output_text"}
+        )
+    return content.strip() if isinstance(content, str) else ""
 
 
 def _parse_codex_output(raw: str) -> tuple[str, str]:
@@ -153,22 +182,11 @@ def _parse_codex_output(raw: str) -> tuple[str, str]:
 
     # Walk in reverse: grab last non-tool event with content + session_id
     for ev in reversed(events):
-        ev_type = ev.get("type", "")
-
         if not session_id:
-            session_id = ev.get("session_id", "") or ev.get("sessionId", "")
+            session_id = _event_session_id(ev)
 
-        if not response and ev_type not in _TOOL_TYPES:
-            content = (ev.get("content", "") or ev.get("text", "")
-                       or ev.get("message", "") or ev.get("output", "")
-                       or ev.get("response", ""))
-            if isinstance(content, list):
-                content = " ".join(
-                    c.get("text", "") for c in content
-                    if isinstance(c, dict) and c.get("type") == "text"
-                )
-            if isinstance(content, str) and content.strip():
-                response = content.strip()
+        if not response:
+            response = _event_response(ev)
 
         if response and session_id:
             break
@@ -177,12 +195,9 @@ def _parse_codex_output(raw: str) -> tuple[str, str]:
     if not response:
         parts = []
         for ev in events:
-            if ev.get("type", "") not in _TOOL_TYPES:
-                text = (ev.get("content", "") or ev.get("text", "")
-                        or ev.get("message", "") or ev.get("output", "")
-                        or ev.get("response", ""))
-                if isinstance(text, str) and text.strip():
-                    parts.append(text.strip())
+            text = _event_response(ev)
+            if text:
+                parts.append(text)
         response = "\n".join(parts) or raw.strip()
 
     return response, session_id
@@ -216,6 +231,12 @@ async def list_tools() -> list[types.Tool]:
                             "Optional. Session ID returned by a previous ask_codex call. "
                             "Pass this to continue the same session."
                         )
+                    },
+                    "workdir": {
+                        "type": "string",
+                        "description": (
+                            "Optional absolute working directory on the remote Mac."
+                        ),
                     }
                 },
                 "required": ["task"]
@@ -236,9 +257,13 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     task           = arguments.get("task", "").strip()
     context        = arguments.get("context", "").strip()
     resume_session = arguments.get("resume_session_id", "").strip()
+    workdir        = arguments.get("workdir", "").strip()
 
     if not task:
         return [types.TextContent(type="text", text="Error: `task` cannot be empty.")]
+    if workdir and not os.path.isabs(workdir):
+        return [types.TextContent(type="text",
+            text="Error: `workdir` must be an absolute path on the remote Mac.")]
 
     call_id    = uuid.uuid4().hex[:8]
     started_at = time.monotonic()
@@ -251,12 +276,12 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         "task":       task,
         "context":    context or None,
         "session_id": resume_session or None,
+        "workdir":    workdir or None,
     })
 
     prompt = f"Context:\n{context}\n\n---\n\nTask:\n{task}" if context else task
-
     codex_args = build_codex_args(MAC_CODEX, resume_session, CODEX_MODEL,
-                                  CODEX_SANDBOX)
+                                  CODEX_SANDBOX, workdir)
     remote_cmd = build_remote_command(codex_args, CODEX_TIMEOUT)
 
     try:
@@ -287,13 +312,13 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         duration = round(time.monotonic() - started_at, 1)
 
         if proc.returncode != 0:
-            err = stderr.decode().strip() or f"exit code {proc.returncode}"
+            err = stderr.decode(errors="replace").strip() or f"exit code {proc.returncode}"
             log_event({"event": "error", "id": call_id,
                        "ts": datetime.now(timezone.utc).isoformat(),
                        "duration": duration, "error": err})
             return [types.TextContent(type="text", text=f"Codex error: {err}")]
 
-        raw            = stdout.decode().strip()
+        raw = stdout.decode(errors="replace").strip()
         result, session_id = _parse_codex_output(raw)
 
         log_event({
@@ -305,7 +330,8 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             "response":   result,
         })
 
-        footer = f"\n\n---\n session_id: `{session_id}`  {duration}s" if session_id else f"\n\n---\n {duration}s"
+        footer = (f"\n\n---\n session_id: `{session_id}`  {duration}s"
+                  if session_id else f"\n\n---\n {duration}s")
         return [types.TextContent(type="text", text=result + footer)]
 
     except Exception as exc:

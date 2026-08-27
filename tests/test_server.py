@@ -17,7 +17,7 @@ from server import (
 
 def test_args_new_session_shape():
     args = build_codex_args("codex", "", "", "")
-    assert args[:2] == ["codex", "exec"]
+    assert args[:5] == ["codex", "--ask-for-approval", "never", "exec", "--json"]
     assert args[-1] == '"$TASK"'
     assert "--ask-for-approval" in args and "--json" in args
     assert "--sandbox" not in args and "--model" not in args
@@ -25,20 +25,22 @@ def test_args_new_session_shape():
 
 def test_args_resume_prompt_is_positional():
     args = build_codex_args("codex", "sess1", "", "")
-    assert args[:5] == ["codex", "exec", "resume", "sess1", '"$TASK"']
+    assert args[-5:] == ["exec", "resume", "--json", "sess1", '"$TASK"']
 
 
 def test_args_resume_is_quoted():
     args = build_codex_args("codex", "s; rm -rf /", "", "")
-    assert args[3] == "'s; rm -rf /'"
+    assert args[-2] == "'s; rm -rf /'"
 
 
 def test_args_model_and_sandbox():
-    args = build_codex_args("codex", "", "gpt-4o", "read-only")
+    args = build_codex_args("codex", "", "gpt-4o", "read-only", "/tmp/my repo")
     m = args.index("--model")
     s = args.index("--sandbox")
     assert args[m + 1] == "gpt-4o"
     assert args[s + 1] == "read-only"
+    assert args[args.index("--cd") + 1] == "'/tmp/my repo'"
+    assert args.index("--sandbox") < args.index("exec")
 
 
 def test_remote_command_reads_stdin_and_has_timeout():
@@ -57,6 +59,18 @@ def test_parse_extracts_last_agent_message_and_session():
     text, sid = _parse_codex_output(raw)
     assert text == "the answer"
     assert sid == "abc"
+
+
+def test_parse_current_codex_jsonl_shape():
+    raw = "\n".join([
+        '{"type":"thread.started","thread_id":"thread-123"}',
+        '{"type":"item.completed","item":{"type":"command_execution","text":"nope"}}',
+        '{"type":"item.completed","item":{"type":"agent_message","text":"fixed"}}',
+        '{"type":"turn.completed","usage":{"input_tokens":10}}',
+    ])
+    text, sid = _parse_codex_output(raw)
+    assert text == "fixed"
+    assert sid == "thread-123"
 
 
 def test_parse_skips_tool_events():
