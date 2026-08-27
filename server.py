@@ -245,6 +245,35 @@ async def list_tools() -> list[types.Tool]:
     ]
 
 
+async def _stop_process(proc: asyncio.subprocess.Process) -> None:
+    """Terminate a timed-out SSH process, escalating to kill if needed."""
+    proc.terminate()
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+
+
+async def _run_ssh_command(remote_cmd: str, prompt: str,
+                           timeout_s: int) -> tuple[int, bytes, bytes]:
+    """Run one remote command and keep timeout cleanup out of tool dispatch."""
+    proc = await asyncio.create_subprocess_exec(
+        "ssh", *SSH_OPTS, MAC_HOST, remote_cmd,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(input=prompt.encode()), timeout=timeout_s
+        )
+    except asyncio.TimeoutError:
+        await _stop_process(proc)
+        raise
+    return proc.returncode or 0, stdout, stderr
+
+
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     if name != "ask_codex":
@@ -285,34 +314,13 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     remote_cmd = build_remote_command(codex_args, CODEX_TIMEOUT)
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "ssh", *SSH_OPTS, MAC_HOST, remote_cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        returncode, stdout, stderr = await _run_ssh_command(
+            remote_cmd, prompt, CODEX_TIMEOUT
         )
-
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=prompt.encode()), timeout=CODEX_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            proc.terminate()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-            duration = round(time.monotonic() - started_at, 1)
-            log_event({"event": "timeout", "id": call_id,
-                       "ts": datetime.now(timezone.utc).isoformat(), "duration": duration})
-            return [types.TextContent(type="text",
-                text=f"Codex timed out after {CODEX_TIMEOUT}s.")]
-
         duration = round(time.monotonic() - started_at, 1)
 
-        if proc.returncode != 0:
-            err = stderr.decode(errors="replace").strip() or f"exit code {proc.returncode}"
+        if returncode != 0:
+            err = stderr.decode(errors="replace").strip() or f"exit code {returncode}"
             log_event({"event": "error", "id": call_id,
                        "ts": datetime.now(timezone.utc).isoformat(),
                        "duration": duration, "error": err})
@@ -334,6 +342,12 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                   if session_id else f"\n\n---\n {duration}s")
         return [types.TextContent(type="text", text=result + footer)]
 
+    except asyncio.TimeoutError:
+        duration = round(time.monotonic() - started_at, 1)
+        log_event({"event": "timeout", "id": call_id,
+                   "ts": datetime.now(timezone.utc).isoformat(), "duration": duration})
+        return [types.TextContent(type="text",
+            text=f"Codex timed out after {CODEX_TIMEOUT}s.")]
     except Exception as exc:
         duration = round(time.monotonic() - started_at, 1)
         err = f"Bridge error ({type(exc).__name__}): {exc}"

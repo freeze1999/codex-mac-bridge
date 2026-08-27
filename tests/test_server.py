@@ -2,17 +2,65 @@
 wrapper, NDJSON output parsing, and log rotation. The SSH path is
 deliberately untested here; it is exercised by a supervised live delegation."""
 
+import asyncio
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import server
 from server import (
     _parse_codex_output,
     build_codex_args,
     build_remote_command,
     should_rotate,
 )
+
+
+class FakeProcess:
+    def __init__(self, delay=0):
+        self.delay = delay
+        self.returncode = 0
+        self.input = None
+        self.terminated = False
+
+    async def communicate(self, input=None):
+        self.input = input
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        return b"stdout", b"stderr"
+
+    def terminate(self):
+        self.terminated = True
+
+    async def wait(self):
+        return self.returncode
+
+
+def test_run_ssh_command_returns_process_output(monkeypatch):
+    proc = FakeProcess()
+
+    async def create_process(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", create_process)
+    result = asyncio.run(server._run_ssh_command("remote", "prompt", 1))
+    assert result == (0, b"stdout", b"stderr")
+    assert proc.input == b"prompt"
+
+
+def test_run_ssh_command_cleans_up_timeout(monkeypatch):
+    proc = FakeProcess(delay=1)
+
+    async def create_process(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", create_process)
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(server._run_ssh_command("remote", "prompt", 0.001))
+    assert proc.terminated
 
 
 def test_args_new_session_shape():
