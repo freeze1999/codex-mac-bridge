@@ -71,18 +71,44 @@ export CODEX_BRIDGE_SANDBOX="read-only"                 # optional, see trust bo
 export CODEX_BRIDGE_LOG_MAX_BYTES="10000000"            # optional, log rotation
 ```
 
-### 4. Wire into your MCP config
+### 4. Connect your agent
 
-```yaml
-mcp_servers:
-  codex_bridge:
-    command: "python3"
-    args: ["/path/to/server.py"]
-    env:
-      CODEX_BRIDGE_SSH_HOST: "user@100.x.x.x"
-      CODEX_BRIDGE_CODEX_BIN: "/usr/local/bin/codex"
-      CODEX_BRIDGE_MODEL: "gpt-4o"
-    timeout: 620  # must exceed CODEX_BRIDGE_TIMEOUT
+Install the bridge on the machine where your main agent runs:
+
+```bash
+git clone https://github.com/freeze1999/codex-mac-bridge.git
+cd codex-mac-bridge
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+
+BRIDGE_DIR="$PWD"
+codex mcp add codex_bridge \
+  --env CODEX_BRIDGE_SSH_HOST="user@100.x.x.x" \
+  --env CODEX_BRIDGE_CODEX_BIN="/opt/homebrew/bin/codex" \
+  --env CODEX_BRIDGE_SANDBOX="workspace-write" \
+  -- "$BRIDGE_DIR/.venv/bin/python" "$BRIDGE_DIR/server.py"
+```
+
+Run `codex mcp list` to confirm the server is configured, then restart Codex.
+In the Codex TUI, `/mcp` shows the active server. The agent discovers the
+`ask_codex` tool from the server automatically. For calls longer than Codex's
+default MCP tool timeout, add `tool_timeout_sec = 620` under
+`[mcp_servers.codex_bridge]` in `~/.codex/config.toml`.
+
+Other MCP hosts can launch the same STDIO server. The equivalent
+[Codex MCP configuration](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)
+is:
+
+```toml
+[mcp_servers.codex_bridge]
+command = "/absolute/path/to/codex-mac-bridge/.venv/bin/python"
+args = ["/absolute/path/to/codex-mac-bridge/server.py"]
+tool_timeout_sec = 620
+
+[mcp_servers.codex_bridge.env]
+CODEX_BRIDGE_SSH_HOST = "user@100.x.x.x"
+CODEX_BRIDGE_CODEX_BIN = "/opt/homebrew/bin/codex"
+CODEX_BRIDGE_SANDBOX = "workspace-write"
 ```
 
 ## Tool usage
